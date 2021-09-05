@@ -1,20 +1,21 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"os"
-	"time"
+	"io"
 	"log"
 	"net/http"
-	"io"
+	"os"
+	"time"
 
 	"encoding/json"
+
 	"github.com/gorilla/websocket"
 
-//	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
-//	"github.com/pion/webrtc/v3/examples/internal/signal"
 )
 
 const homeHTML = `<!DOCTYPE html>
@@ -102,7 +103,6 @@ function stopCamera() {
             pc.removeTrack(senders[i]);
             cameraTrack = null;
             localVideo.srcObject = null;
-            remoteVideo.srcObject = null;
             console.log("Camera stopped.");
             return;
         }
@@ -175,7 +175,7 @@ var (
 	}
 
 	peerConnectionConfig = webrtc.Configuration{}
-	peerConnection *webrtc.PeerConnection
+	peerConnection       *webrtc.PeerConnection
 	//videoTrack = &webrtc.TrackLocalStaticSample{}
 )
 
@@ -213,7 +213,7 @@ func sendOffer(pc *webrtc.PeerConnection, ws *websocket.Conn) error {
 		return err
 	}
 
-	log.Printf("Offer sent to browser.");
+	log.Printf("Offer sent to browser.")
 	return ws.WriteJSON(&websocketMessage{
 		Event: "offer",
 		Data:  string(offerString),
@@ -237,7 +237,7 @@ func sendAnswer(pc *webrtc.PeerConnection, ws *websocket.Conn) error {
 		return err
 	}
 
-	log.Printf("Answer sent to browser.");
+	log.Printf("Answer sent to browser.")
 	return ws.WriteJSON(&websocketMessage{
 		Event: "answer",
 		Data:  string(answerString),
@@ -318,6 +318,31 @@ func setupPeerConnection() {
 		panic(err)
 	}
 
+	packets := make(chan *rtp.Packet, 60)
+
+	// Asynchronously take all packets in the channel and write them out to our
+	// track
+	go func() {
+		var currTimestamp uint32
+		for i := uint16(0); ; i++ {
+			packet := <-packets
+			// Timestamp on the packet is really a diff, so add it to current
+			currTimestamp += packet.Timestamp
+			packet.Timestamp = currTimestamp
+			// Keep an increasing sequence number
+			packet.SequenceNumber = i
+			// Write out the packet, ignoring closed pipe if nobody is listening
+			if err := outputTrack.WriteRTP(packet); err != nil {
+				if errors.Is(err, io.ErrClosedPipe) {
+					// The peerConnection has been closed.
+					return
+				}
+
+				panic(err)
+			}
+		}
+	}()
+
 	// Add this newly created track to the PeerConnection
 	rtpSender, err := peerConnection.AddTrack(outputTrack)
 	if err != nil {
@@ -352,6 +377,8 @@ func setupPeerConnection() {
 		}()
 
 		fmt.Printf("Track %s has started, of type %d: %s \n", track.ID(), track.PayloadType(), track.Codec().MimeType)
+		var lastTimestamp uint32
+
 		for {
 			// Read RTP packets being sent to Pion
 			rtp, _, readErr := track.ReadRTP()
@@ -359,15 +386,20 @@ func setupPeerConnection() {
 			if readErr == io.EOF {
 				fmt.Printf("Track %s ended.", track.ID())
 				break
-			}
-
-			if readErr != nil {
+			} else if readErr != nil {
 				panic(readErr)
 			}
 
-			if writeErr := outputTrack.WriteRTP(rtp); writeErr != nil {
-				panic(writeErr)
+			// Change the timestamp to only be the delta
+			oldTimestamp := rtp.Timestamp
+			if lastTimestamp == 0 {
+				rtp.Timestamp = 0
+			} else {
+				rtp.Timestamp -= lastTimestamp
 			}
+
+			lastTimestamp = oldTimestamp
+			packets <- rtp
 		}
 	})
 
